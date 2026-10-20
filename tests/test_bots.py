@@ -465,3 +465,101 @@ def test_discord_rejects_a_non_numeric_id(monkeypatch, capsys, name, value):
     monkeypatch.setattr(discordbot, "WatchlistClient", no_client)
     discordbot.main()
     assert f"{name} must be a numeric Discord id" in capsys.readouterr().out
+
+
+# --- Discord error readability ---------------------------------------------- #
+def _chained(outer, inner):
+    """`outer` raised from `inner`, as aiohttp/discord.py build them."""
+    try:
+        try:
+            raise inner
+        except BaseException as exc:
+            raise outer from exc
+    except BaseException as exc:
+        return exc
+
+
+def _reconnect_record(error, retry=1.4):
+    import logging
+
+    return logging.LogRecord(
+        "discord.client", logging.ERROR, __file__, 0,
+        "Attempting a reconnect in %.2fs", (retry,), (type(error), error, None),
+    )
+
+
+@needs_discord
+def test_discord_reconnect_traceback_becomes_one_line():
+    """A network outage logged a ~60-line traceback per retry; now each retry
+    is one WARNING saying why, and reconnecting reports how long it lasted."""
+    import logging
+    import socket
+
+    import aiohttp
+
+    dns = _chained(
+        aiohttp.ClientConnectionError("Cannot connect to host gateway.discord.gg:443"),
+        socket.gaierror(-3, "Temporary failure in name resolution"),
+    )
+    f = discordbot.ReconnectLogFilter()
+    first = _reconnect_record(dns)
+    assert f.filter(first)
+    assert first.levelno == logging.WARNING and first.exc_info is None
+    assert "Lost connection" in first.getMessage() and "DNS" in first.getMessage()
+
+    second = _reconnect_record(dns, retry=28.7)
+    f.filter(second)
+    assert "attempt 2" in second.getMessage() and "29s" in second.getMessage()
+
+    assert "2 failed attempts" in f.recovered()
+    assert f.recovered() == ""  # reset once reported
+
+    other = logging.LogRecord("discord.client", logging.ERROR, __file__, 0, "x %s", ("y",), None)
+    assert f.filter(other) and other.getMessage() == "x y"
+
+
+@needs_discord
+def test_discord_connection_failure_reasons():
+    import errno
+
+    unreachable = _chained(
+        ConnectionError("Cannot connect"), OSError(errno.ENETUNREACH, "Network is unreachable")
+    )
+    assert "network is unreachable" in discordbot.describe_connection_failure(unreachable)
+    timeout = _chained(TimeoutError(), asyncio.CancelledError())
+    assert "60 seconds" in discordbot.describe_connection_failure(timeout)
+
+
+class _Resp:
+    def __init__(self, status, reason):
+        self.status, self.reason = status, reason
+
+
+@needs_discord
+def test_discord_expired_interaction_is_one_readable_line(caplog):
+    """A click answered after Discord's 3-second window raised 404 "Unknown
+    interaction" (10062), logged as an opaque traceback."""
+    expired = discordbot.discord.NotFound(
+        _Resp(404, "Not Found"), {"code": 10062, "message": "Unknown interaction"}
+    )
+    assert "3 seconds" in discordbot.describe_error(expired)
+
+    client = _client("5")
+    try:
+        raise expired
+    except discordbot.discord.NotFound:
+        asyncio.run(client.on_error("on_interaction"))
+    record = caplog.records[-1]
+    assert record.levelname == "WARNING" and record.exc_info is None
+    assert "button click" in record.getMessage() and "try again" in record.getMessage()
+
+
+@needs_discord
+def test_discord_unexpected_handler_error_keeps_traceback(caplog):
+    client = _client("5")
+    try:
+        raise KeyError("bug")
+    except KeyError:
+        asyncio.run(client.on_error("on_interaction"))
+    record = caplog.records[-1]
+    assert record.levelname == "ERROR" and record.exc_info is not None
