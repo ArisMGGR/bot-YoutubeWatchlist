@@ -1,0 +1,27 @@
+# exceptions.txt — opt out of notifications from channels you're SUBSCRIBED to.
+#
+# Your watchlist is your YouTube account's subscriptions (read automatically).
+# This file is optional and only ever *removes* notifications — leave it empty
+# to be notified about everything you're subscribed to.
+#
+# Tip: you can also add these from Telegram — send the bot /except and pick the
+# channel and opt-out with buttons. It appends lines here (tagged with the
+# channel name in a comment).
+#
+# One rule per line, in one of these forms:
+#
+#   <channel>                    mute the channel entirely (no notifications)
+#   <channel> = videos           ONLY regular videos   (mute livestreams/premieres)
+#   <channel> = livestreams      ONLY livestreams      (mute regular videos)
+#
+# <channel> can be any of:
+#   @handle
+#   https://www.youtube.com/@handle
+#   https://www.youtube.com/channel/UCxxxxxxxxxxxxxxxxxxxxxx
+#   UCxxxxxxxxxxxxxxxxxxxxxx        (raw channel ID)
+#
+# Lines starting with # are ignored. Examples (remove the # to activate):
+#
+# @SomeNoisyChannel                  # never notify me about this one
+# @NewsNetwork = videos              # skip their 24/7 livestreams, keep uploads
+# @MyFavoriteStreamer = livestreams  # only ping me when they go live

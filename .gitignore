@@ -1,0 +1,59 @@
+# Local config — conf.env holds the bot tokens; setup_bot.py keeps a .bak copy.
+conf.env
+conf.env.bak
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+venv/
+.venv/
+
+# Atomic-write leftovers (archive.py, discovery.py, youtube_playlist.py)
+*.tmp
+
+# Secrets — never commit these. They stay on the machine running the bot.
+#   token.txt            Telegram bot token (if not using conf.env)
+#   discord_token.txt    Discord bot token (if not using conf.env)
+#   client_secret*.json  Google OAuth clients (from the Cloud Console), also under
+#                        the name Google downloads them as
+#                        (client_secret_<id>.apps.googleusercontent.com.json)
+#   youtube_token.json   YouTube access/refresh token (from authorize_youtube.py)
+token.txt
+discord_token.txt
+client_secret*.json
+youtube_token.json
+
+# Your local per-channel opt-outs. Copy manual-setup/exceptions.txt.example to exceptions.txt
+# and edit it (or let the bot's /except command write it for you); keep it local
+# so `git switch`/`pull` never collide with your edits.
+exceptions.txt
+
+# Runtime state — recreated on first run, so there's nothing to commit:
+#   archive.json         seen videos, resolved channel IDs, learned notify chat/channel
+#   youtube_state.json   cached id of your saved-videos playlist
+archive.json
+youtube_state.json
+
+# Daily run logs — regenerated on every run (see logging_setup.py). *.log also
+# covers a LOG_DIR pointed somewhere other than logs/.
+logs/
+*.log
+
+# Your filled-in systemd unit — copy manual-setup/deploy/youtube-watchlist-bot.service.example
+# to this path, edit in your own User/WorkingDirectory/python3, and keep it local
+# so `git switch`/`pull` never collide with your edits.
+manual-setup/deploy/youtube-watchlist-bot.service
+
+# Claude Code's per-machine settings (the shared .claude/settings.json is fine
+# to commit).
+.claude/settings.local.json
+
+# Audit reports and their working notes — kept local.
+tests/FINDINGS.md
+tests/LOG.md
+tests/VERIFY.md
+
+# Windows (development machine)
+Thumbs.db
+desktop.ini
