@@ -25,7 +25,11 @@ Setup (one time):
 No privileged intents are needed — the bot never reads message content.
 """
 import asyncio
+import errno
 import logging
+import socket
+import sys
+import time
 
 import aiohttp
 import discord
@@ -146,6 +150,9 @@ def _video_view(video_id, *, saved=False):
 # --------------------------------------------------------------------------- #
 def describe_error(error: Exception) -> str:
     """Turn an exception into one short, human-readable line (or '' if unknown)."""
+    expired = describe_expired_interaction(error)
+    if expired:
+        return expired
     if isinstance(error, discord.LoginFailure):
         return (
             "❌ Discord rejected the bot token. Check DISCORD_BOT_TOKEN in your "
@@ -178,10 +185,185 @@ def describe_error(error: Exception) -> str:
         (discord.ConnectionClosed, discord.GatewayNotFound, aiohttp.ClientConnectionError),
     ):
         return (
-            "🌐 Connection to Discord dropped. Temporary network trouble — the "
-            "client reconnects automatically."
+            f"🌐 Connection to Discord dropped: {describe_connection_failure(error)}. "
+            "The client reconnects automatically."
         )
     return ""
+
+
+# Discord error codes for an interaction we answered too late / twice.
+_UNKNOWN_INTERACTION = 10062
+_ALREADY_ACKNOWLEDGED = 40060
+
+
+def describe_expired_interaction(error: Exception) -> str:
+    """A click or command we couldn't answer in time, or '' if that's not it.
+
+    Discord gives the bot 3 seconds to acknowledge an interaction; after that
+    the token is dead and any reply gets 404 "Unknown interaction" (10062).
+    The usual cause is a slow or flaky network on the bot's side, or a click
+    delivered late right after a reconnect. Nothing was done for that click,
+    so trying again is safe.
+    """
+    if isinstance(error, discord.NotFound) and error.code == _UNKNOWN_INTERACTION:
+        return (
+            "⌛ A button click or command expired before I could answer it — "
+            "Discord allows 3 seconds and my reply took longer (slow network, "
+            "or the click arrived during a reconnect). Nothing was changed; "
+            "just try again."
+        )
+    if isinstance(error, discord.HTTPException) and error.code == _ALREADY_ACKNOWLEDGED:
+        return (
+            "⌛ Discord says that click was already answered (probably a "
+            "double-click). Nothing to do."
+        )
+    return ""
+
+
+def _exception_chain(error):
+    """`error` and everything it was raised from, outermost first."""
+    seen = []
+    while error is not None and error not in seen:
+        seen.append(error)
+        error = error.__cause__ or error.__context__
+    return seen
+
+
+def describe_connection_failure(error: Exception) -> str:
+    """Why we couldn't reach Discord, in plain words (no trailing period).
+
+    Library tracebacks bury the real reason several "direct cause" levels
+    deep (aiohttp → asyncio → socket), so look through the whole chain.
+    """
+    chain = _exception_chain(error)
+
+    def find(kind):
+        return next((e for e in chain if isinstance(e, kind)), None)
+
+    # ClientConnectorDNSError only exists in aiohttp >= 3.11.
+    dns_error = getattr(aiohttp, "ClientConnectorDNSError", socket.gaierror)
+    if find(socket.gaierror) or find(dns_error):
+        return (
+            "can't look up Discord's address (DNS lookup failed) — this "
+            "machine's internet connection or DNS server is down"
+        )
+    os_errors = [e for e in chain if isinstance(e, OSError) and e.errno is not None]
+    errnos = {e.errno for e in os_errors}
+    if errnos & {errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ENETDOWN}:
+        return (
+            "network is unreachable — this machine has no working internet "
+            "connection (Wi-Fi/Ethernet down, or the router is restarting)"
+        )
+    if errnos & {errno.ECONNREFUSED, errno.ECONNRESET, errno.ECONNABORTED}:
+        return "the connection was refused or reset on the way to Discord"
+    closed = find(discord.ConnectionClosed)
+    if closed is not None:
+        return f"Discord closed the connection (close code {closed.code})"
+    if find(discord.GatewayNotFound):
+        return (
+            "Discord's gateway is unavailable — probably a Discord outage "
+            "(see https://discordstatus.com)"
+        )
+    http = find(discord.HTTPException)
+    if http is not None and http.status >= 500:
+        return (
+            f"Discord's servers answered with an error (HTTP {http.status}) — "
+            "probably a Discord outage (see https://discordstatus.com)"
+        )
+    if find(TimeoutError) or find(aiohttp.ServerTimeoutError):
+        return (
+            "Discord didn't answer within 60 seconds — the connection is very "
+            "slow or dropping packets"
+        )
+    if find(aiohttp.ServerDisconnectedError):
+        return "Discord's server hung up on us"
+    return f"{type(error).__name__}: {error}" if str(error) else type(error).__name__
+
+
+def _fmt_duration(seconds):
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes} min {seconds}s" if seconds else f"{minutes} min"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours} h {minutes} min"
+
+
+class ReconnectLogFilter(logging.Filter):
+    """Rewrite discord.py's reconnect tracebacks into one readable line each.
+
+    While the network is down, discord.py logs ``Attempting a reconnect in
+    Ns`` at ERROR with a ~60-line traceback on every retry. That's just the
+    library doing its job, so this turns each one into a single WARNING that
+    says *why* (DNS down, network unreachable, timeout …), counts the
+    attempts, and lets :meth:`recovered` report how long the outage lasted.
+    Attached to the ``discord.client`` logger; any other record passes as is.
+    """
+
+    _RECONNECT_MSG = "Attempting a reconnect in %.2fs"
+
+    def __init__(self):
+        super().__init__()
+        self.outage_started = None  # time.monotonic() of the first failure
+        self.attempts = 0
+
+    def filter(self, record):
+        if record.msg != self._RECONNECT_MSG or not record.exc_info:
+            return True
+        error = record.exc_info[1]
+        retry = record.args[0] if record.args else 0
+        reason = describe_connection_failure(error)
+        now = time.monotonic()
+        self.attempts += 1
+        if self.outage_started is None:
+            self.outage_started = now
+            text = (
+                f"🌐 Lost connection to Discord: {reason}. Retrying in "
+                f"{retry:.0f}s — I reconnect on my own once the network is back."
+            )
+        else:
+            text = (
+                f"🌐 Still can't reach Discord (attempt {self.attempts}, offline "
+                f"for {_fmt_duration(now - self.outage_started)}): {reason}. "
+                f"Next try in {retry:.0f}s."
+            )
+        record.msg, record.args = text, ()
+        record.exc_info = record.exc_text = None
+        record.levelno, record.levelname = logging.WARNING, "WARNING"
+        return True
+
+    def recovered(self):
+        """Call once connected again: a summary of the outage, or '' if none."""
+        if self.outage_started is None:
+            return ""
+        took = _fmt_duration(time.monotonic() - self.outage_started)
+        attempts = self.attempts
+        self.outage_started, self.attempts = None, 0
+        return (
+            f"✅ Back online — Discord was unreachable for {took} "
+            f"({attempts} failed attempt{'s' if attempts != 1 else ''})."
+        )
+
+
+reconnect_log = ReconnectLogFilter()
+logging.getLogger("discord.client").addFilter(reconnect_log)
+
+
+def log_handler_error(where, error):
+    """Log an exception that escaped a button or command handler.
+
+    Known, harmless ones (an expired click, a dropped connection, a missing
+    permission) get one readable line. Anything else is a real bug and keeps
+    its traceback — as does a generic Discord rejection, which usually means
+    we sent something malformed.
+    """
+    friendly = describe_error(error)
+    if friendly and type(error) is not discord.HTTPException:
+        log.warning("While %s: %s", where, friendly)
+    else:
+        log.error("Unexpected error while %s:", where, exc_info=error)
 
 
 # --------------------------------------------------------------------------- #
@@ -284,6 +466,7 @@ class WatchlistClient(discord.Client):
 
     async def on_ready(self):
         log.info("Connected to Discord as %s.", self.user)
+        self._log_recovery()
         if self.notify_channel_id is None:
             log.warning(
                 "No notification channel yet — run /start in the channel you "
@@ -299,6 +482,23 @@ class WatchlistClient(discord.Client):
             self._check_task = self.loop.create_task(
                 checker.check_loop(DiscordNotifier(self), self.check_state)
             )
+
+    async def on_resumed(self):
+        # A reconnect that picks the old session back up fires this, not on_ready.
+        self._log_recovery()
+
+    @staticmethod
+    def _log_recovery():
+        summary = reconnect_log.recovered()
+        if summary:
+            log.info(summary)
+
+    async def on_error(self, event_method, /, *args, **kwargs):
+        """An exception escaped an event handler (e.g. a button click)."""
+        where = "handling a button click" if event_method == "on_interaction" else (
+            f"handling {event_method}"
+        )
+        log_handler_error(where, sys.exc_info()[1])
 
     # -- authorization ---------------------------------------------------- #
     def authorized(self, channel_id):
@@ -588,6 +788,12 @@ def _not_allowed(interaction):
 
 def _register_commands(client: WatchlistClient):
     tree = client.tree
+
+    @tree.error
+    async def on_command_error(interaction: discord.Interaction, error):
+        command = getattr(interaction.command, "name", None)
+        where = f"running /{command}" if command else "running a command"
+        log_handler_error(where, getattr(error, "original", error))
 
     @tree.command(name="start", description="Post notifications in this channel")
     async def start(interaction: discord.Interaction):
