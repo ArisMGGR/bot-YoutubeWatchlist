@@ -26,7 +26,7 @@ def test_ask_number_rejects_negative_then_accepts(monkeypatch):
 
 def test_read_conf_tolerates_bom(tmp_path):
     p = tmp_path / "conf.env"
-    p.write_bytes(b"\xef\xbb\xbfTELEGRAM_BOT_TOKEN=t\n# X=1\nY = 'q'\n")
+    p.write_bytes(b"\xef\xbb\xbfTELEGRAM_BOT_TOKEN=t\n# X=1\nY = 'q'\n=no key\n")
     assert setup_bot.read_conf(p) == {"TELEGRAM_BOT_TOKEN": "t", "Y": "q"}
 
 
@@ -70,6 +70,31 @@ def test_install_service_writes_paths_with_sed_metacharacters(tmp_path):
     assert f"WorkingDirectory={project}\n" in unit
     assert f"EnvironmentFile=-{project}/conf.env\n" in unit
     assert f'ExecStart="{sys.executable}" ytwatchlistbot.py\n' in unit
+
+
+@pytest.mark.skipif(
+    os.name != "posix" or os.geteuid() == 0
+    or not shutil.which("bash") or not shutil.which("id"),
+    reason="needs a POSIX shell, not as root (the installer refuses User=root)",
+)
+def test_installer_token_warning_knows_the_token_files(tmp_path):
+    """Regression (F-073): with no conf.env the installer said the bot needs
+    TELEGRAM_BOT_TOKEN and will crash-loop, even when its token is in
+    discord_token.txt (which starts fine)."""
+    import getpass
+
+    project = tmp_path / "bot"
+    shutil.copytree(setup_bot.SETUP_DIR / "deploy", project / "manual-setup" / "deploy")
+    script = str(project / "manual-setup" / "deploy" / "install-service.sh")
+    env = dict(os.environ, SERVICE_USER=getpass.getuser(), PYTHON=sys.executable)
+
+    def dry_run():
+        return subprocess.run(["bash", script, "--dry-run"], env=env,
+                              capture_output=True, text=True, check=True).stdout
+
+    assert "WARNING: no bot token found" in dry_run()
+    (project / "discord_token.txt").write_text("d\n", encoding="utf-8")
+    assert "WARNING" not in dry_run()
 
 
 def test_set_conf_key_replaces_a_spaced_active_line(tmp_path, monkeypatch):
@@ -310,6 +335,29 @@ def test_service_step_without_sudo_does_not_crash(monkeypatch):
     monkeypatch.setattr(setup_bot, "say", lambda m="": said.append(m))
     assert setup_bot.service_step() is None
     assert ran == [] and any("sudo isn't installed" in m for m in said)
+
+
+def test_setup_survives_a_console_without_box_drawing(monkeypatch):
+    """Regression (F-075): with its output piped or redirected on Windows (the
+    ANSI code page), the first step header ("── Step 1/7") raised
+    UnicodeEncodeError before anything was checked."""
+    import io
+
+    out = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
+    monkeypatch.setattr(setup_bot.sys, "stdout", out)
+    monkeypatch.setattr(setup_bot.sys, "argv", ["setup_bot.py"])
+
+    class Reached(Exception):
+        pass
+
+    def preflight():
+        raise Reached
+
+    monkeypatch.setattr(setup_bot, "preflight", preflight)
+    with pytest.raises(Reached):
+        setup_bot.main()
+    out.flush()
+    assert "? Step 1/7: Checking your environment" in out.buffer.getvalue().decode("cp1252")
 
 
 def test_uninstaller_parses_arguments_before_asking_for_root():

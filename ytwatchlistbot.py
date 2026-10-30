@@ -41,7 +41,7 @@ if __name__ == "__main__" and config.CHAT_PLATFORM == "discord":
     raise SystemExit(discordbot.main())
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.constants import ParseMode
+from telegram.constants import ChatMemberStatus, ChatType, ParseMode
 from telegram.error import (
     BadRequest,
     Conflict,
@@ -89,6 +89,11 @@ _AUTH_TIP = (
 
 # /except conversation states.
 EXC_CHANNEL, EXC_TYPE = range(2)
+
+# Commands and typed answers are taken from new messages only. Handlers match
+# edited messages too by default, and those carry no `update.message`: editing
+# a sent "/chek" into "/help" would crash the handler instead of running it.
+NEW_MESSAGE = filters.UpdateType.MESSAGE
 
 # Button choice -> exception rule (values from discovery).
 _EXC_RULES = {
@@ -139,6 +144,31 @@ def _authorized(context, chat_id):
     to their own chat."""
     target = _notify_chat_id(context)
     return target is None or str(chat_id) == str(target)
+
+
+async def _may_control(update, context):
+    """May whoever sent this update use the bot? It must come from the notify
+    chat (see :func:`_authorized`). In a private chat that's the owner. In a
+    group or channel, every member reads the notifications and can tap the
+    buttons, so the chat alone isn't enough: it takes an admin of that chat,
+    as Discord takes Manage Server."""
+    chat = update.effective_chat
+    if not _authorized(context, chat.id):
+        return False
+    if chat.type == ChatType.PRIVATE:
+        return True
+    message = update.message
+    if message is not None and getattr(message.sender_chat, "id", None) == chat.id:
+        return True  # an anonymous admin, posting as the group itself
+    user = update.effective_user
+    if user is None:
+        return False
+    try:
+        member = await context.bot.get_chat_member(chat.id, user.id)
+    except TelegramError as exc:
+        log.warning("Couldn't check whether user %s is an admin: %s", user.id, exc)
+        return False
+    return member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
 
 
 # Shown to anyone who isn't the owner's chat. Deliberately says nothing about
@@ -268,6 +298,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _authorized(context, chat_id):
         await update.message.reply_text(_NOT_YOUR_CHAT)
         return
+    # In a group, only an admin may register it (or see the how-to).
+    if not await _may_control(update, context):
+        return
     # Learn where to notify if TELEGRAM_CHAT_ID wasn't configured.
     if not config.TELEGRAM_CHAT_ID:
         context.application.bot_data["notify_chat_id"] = str(chat_id)
@@ -285,7 +318,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _authorized(context, update.effective_chat.id):
+    if not await _may_control(update, context):
         return
     await update.message.reply_text(
         "<b>How I work</b>\n\n"
@@ -306,7 +339,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _authorized(context, update.effective_chat.id):
+    if not await _may_control(update, context):
         return
     if checker.check_lock().locked():
         await update.message.reply_text("⏳ A check is already running…")
@@ -314,10 +347,29 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔎 Checking your channels now…")
     # In the background: python-telegram-bot handles one update at a time, so
     # awaiting the check here would leave every tap and command unanswered
-    # until a pass over all the feeds finished.
-    context.application.create_task(
-        run_check(context.application, trigger="manual"), update=update
+    # until a pass over all the feeds finished. A plain asyncio task, not
+    # application.create_task: Application.stop() waits for those, so stopping
+    # the bot mid-check would wait for the whole pass (the periodic check
+    # isn't waited for either). Kept in bot_data so it isn't garbage-collected.
+    context.application.bot_data["check_task"] = asyncio.create_task(
+        _manual_check(context.application, update.message)
     )
+
+
+async def _manual_check(application: Application, message):
+    """Run a /check; if it fails, log why and say so in the chat."""
+    try:
+        await run_check(application, trigger="manual")
+    except Exception as exc:  # noqa: BLE001 - the /check must be answered
+        friendly = describe_error(exc)
+        if friendly:
+            log.warning("During /check: %s", friendly)
+        else:
+            log.error("Unexpected error during /check:", exc_info=exc)
+        try:
+            await message.reply_text("😵 The check failed — see the log.")
+        except TelegramError as reply_exc:
+            log.warning("Couldn't report the failed /check: %s", reply_exc)
 
 
 # --------------------------------------------------------------------------- #
@@ -338,7 +390,7 @@ def _exception_keyboard():
 
 async def except_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Entry point for /except — ask which channel to add an exception for."""
-    if not _authorized(context, update.effective_chat.id):
+    if not await _may_control(update, context):
         return ConversationHandler.END
     context.user_data.pop("exc_channel", None)  # a restarted /except starts clean
     if not youtube_playlist.is_configured():
@@ -452,16 +504,18 @@ def except_conversation():
     otherwise swallow every later /except without a reply until /cancel.
     """
     return ConversationHandler(
-        entry_points=[CommandHandler("except", except_start)],
+        entry_points=[CommandHandler("except", except_start, filters=NEW_MESSAGE)],
         states={
             EXC_CHANNEL: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, except_channel)
+                MessageHandler(
+                    NEW_MESSAGE & filters.TEXT & ~filters.COMMAND, except_channel
+                )
             ],
             EXC_TYPE: [
                 CallbackQueryHandler(except_type, pattern=f"^{CB_EXCEPT}")
             ],
         },
-        fallbacks=[CommandHandler("cancel", except_cancel)],
+        fallbacks=[CommandHandler("cancel", except_cancel, filters=NEW_MESSAGE)],
         allow_reentry=True,
     )
 
@@ -475,7 +529,7 @@ def _auth_task(application):
 
 
 async def authorize_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _authorized(context, update.effective_chat.id):
+    if not await _may_control(update, context):
         return
     app = context.application
     if _auth_task(app) is not None and not _auth_task(app).done():
@@ -618,7 +672,7 @@ async def _wait_for_approval(application: Application, chat_id, message_id, flow
 async def on_auth_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Yes / Keep it / Cancel taps from /authorize."""
     query = update.callback_query
-    if not _authorized(context, update.effective_chat.id):
+    if not await _may_control(update, context):
         await query.answer()
         return
     await query.answer()
@@ -647,7 +701,7 @@ async def on_auth_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --------------------------------------------------------------------------- #
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if not _authorized(context, update.effective_chat.id):
+    if not await _may_control(update, context):
         await query.answer()
         return
 
@@ -751,7 +805,10 @@ def describe_error(error: Exception) -> str:
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     friendly = describe_error(context.error)
     if friendly:
-        log.warning(friendly)
+        # A BadRequest usually means we sent something malformed, so it keeps
+        # its traceback (as on Discord) to show which message it was.
+        bad_request = isinstance(context.error, BadRequest)
+        log.warning(friendly, exc_info=context.error if bad_request else None)
         return
     log.error("Unexpected error while handling an update:", exc_info=context.error)
     if isinstance(update, Update) and update.effective_message:
@@ -798,6 +855,21 @@ async def post_init(application: Application):
     )
 
 
+def handlers():
+    """Every update handler, in the order they're registered."""
+    return [
+        CommandHandler("start", start, filters=NEW_MESSAGE),
+        CommandHandler("help", help_command, filters=NEW_MESSAGE),
+        CommandHandler("check", check_command, filters=NEW_MESSAGE),
+        CommandHandler("authorize", authorize_command, filters=NEW_MESSAGE),
+        # Before the generic button handler, so the conversation's `exc:`
+        # callbacks are handled there while a conversation is active.
+        except_conversation(),
+        CallbackQueryHandler(on_auth_button, pattern=f"^{CB_AUTH}"),
+        CallbackQueryHandler(on_button),
+    ]
+
+
 def main():
     # Running this file directly is handled at the top of the module (it must
     # be, to skip the telegram imports). This covers main() being called from
@@ -826,18 +898,8 @@ def main():
         .post_init(post_init)
         .build()
     )
-
-    # Registered before the generic button handler so the conversation's
-    # `exc:` callbacks are handled there while a conversation is active.
-    except_conv = except_conversation()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("check", check_command))
-    app.add_handler(CommandHandler("authorize", authorize_command))
-    app.add_handler(except_conv)
-    app.add_handler(CallbackQueryHandler(on_auth_button, pattern=f"^{CB_AUTH}"))
-    app.add_handler(CallbackQueryHandler(on_button))
+    for handler in handlers():
+        app.add_handler(handler)
     app.add_error_handler(on_error)
 
     log.info(

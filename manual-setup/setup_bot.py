@@ -352,6 +352,8 @@ def read_conf(path):
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, val = line.partition("=")
+        if not key.strip():
+            continue  # "=value" has no name; config.py skips it too
         values[key.strip()] = val.strip().strip('"').strip("'")
     return values
 
@@ -630,6 +632,10 @@ def main():
         help="install both chat libraries, not just the one you pick",
     )
     args = parser.parse_args()
+    # Output piped or redirected on Windows uses the ANSI code page, which has
+    # no box-drawing characters or emoji: show "?" instead of crashing.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="replace")
 
     total = 7
     say()

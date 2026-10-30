@@ -148,6 +148,51 @@ def test_authorize_script_rejects_unknown_flags(capsys):
     assert authorize_youtube.parse_args(["--device"]).device
 
 
+def test_authorize_bare_pasted_code_is_url_decoded():
+    """Regression (F-086): the full URL and `code=...` forms were decoded by
+    parse_qs, but a bare code copied out of the address bar (`4%2F0A...`)
+    went to Google still encoded."""
+    import authorize_youtube
+
+    for pasted in ("http://localhost/?state=s&code=4%2F0AbCd&scope=x",
+                   "code=4%2F0AbCd&scope=x", "4%2F0AbCd", "4/0AbCd"):
+        assert authorize_youtube._extract_code(pasted) == "4/0AbCd", pasted
+
+
+def test_authorize_script_survives_a_console_without_emoji(monkeypatch, tmp_path):
+    """Regression (F-075): with its output piped or redirected on Windows (the
+    ANSI code page, no emoji), "✅ Saved" raised UnicodeEncodeError after the
+    token was already written, so a successful authorization ended in a
+    traceback and exit status 1."""
+    import io
+    import sys
+    import time
+
+    import authorize_youtube
+    import youtube_playlist
+
+    pytest.importorskip("google.oauth2.credentials")  # --device checks for it
+    out = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
+    monkeypatch.setattr(sys, "stdout", out)
+    secret = tmp_path / "client_secret.json"
+    secret.write_text("{}", encoding="utf-8")
+    token = tmp_path / "youtube_token.json"
+    monkeypatch.setattr(config, "YOUTUBE_DEVICE_CLIENT_SECRET_FILE", str(secret))
+    monkeypatch.setattr(config, "YOUTUBE_TOKEN_FILE", str(token))
+    monkeypatch.setattr(config, "YOUTUBE_PLAYLIST_STATE_FILE", str(tmp_path / "state.json"))
+    monkeypatch.setattr(youtube_auth, "start", lambda secret_file: youtube_auth.DeviceFlow(
+        "CODE", "https://www.google.com/device", "dev", 0, time.monotonic() + 60, "cid", "sec"))
+    creds = type("C", (), {"refresh_token": "r", "to_json": lambda self: '{"refresh_token": "r"}'})()
+    monkeypatch.setattr(youtube_auth, "wait", lambda flow: creds)
+    monkeypatch.setattr(youtube_playlist, "current_channel", lambda c: {"id": "UC1", "title": "Me 🎮"})
+
+    authorize_youtube.main(["--device"])
+    out.flush()
+    text = out.buffer.getvalue().decode("cp1252")
+    assert token.exists()
+    assert "? Saved" in text and "Connected as channel: Me ? (UC1)" in text
+
+
 # --- Telegram glue ---------------------------------------------------------- #
 class _Bot:
     def __init__(self):
@@ -189,7 +234,7 @@ class _Msg:
 
 def _update(chat_id):
     return type("U", (), {
-        "effective_chat": type("C", (), {"id": chat_id})(), "message": _Msg(),
+        "effective_chat": type("C", (), {"id": chat_id, "type": "private"})(), "message": _Msg(),
     })()
 
 
@@ -267,7 +312,7 @@ def test_telegram_cancel_button_stops_the_wait(secret_file, google, monkeypatch)
         await tgbot._begin_authorization(app, 111)
         task = app.bot_data["auth_task"]
         q = _Query(f"{tgbot.CB_AUTH}cancel")
-        upd = type("U", (), {"callback_query": q, "effective_chat": type("C", (), {"id": 111})()})()
+        upd = type("U", (), {"callback_query": q, "effective_chat": type("C", (), {"id": 111, "type": "private"})()})()
         await tgbot.on_auth_button(upd, _Ctx(app))
         await asyncio.sleep(0)
         assert task.cancelled() or task.done()
@@ -451,6 +496,19 @@ def test_discord_yes_is_acknowledged_before_asking_google(monkeypatch):
 
     asyncio.run(scenario())
     assert events == ["ack", "google", "code shown"]
+
+
+def test_failed_token_write_keeps_the_old_token(tmp_path):
+    """Regression (F-083): the token write was checked only for a leftover
+    .tmp, which an in-place write also passes. A write that fails midway (a
+    lone surrogate can't be encoded) must leave the previous token intact."""
+    import youtube_playlist
+
+    token = tmp_path / "youtube_token.json"
+    youtube_playlist.write_private(str(token), '{"refresh_token": "r1"}')
+    with pytest.raises(UnicodeEncodeError):
+        youtube_playlist.write_private(str(token), '{"refresh_token": "\ud800"}')
+    assert json.loads(token.read_text(encoding="utf-8")) == {"refresh_token": "r1"}
 
 
 @pytest.mark.skipif(os.name != "posix", reason="file modes are POSIX-only")

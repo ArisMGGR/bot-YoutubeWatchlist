@@ -335,11 +335,38 @@ def _hint(err):
         )
 
 
+def parse_args(argv=None):
+    """Command-line options. Unknown ones are an error, so `--help` (or a typo)
+    never reaches YouTube as a video id."""
+    import argparse
+    import re
+
+    parser = argparse.ArgumentParser(
+        description="Self-test: check the YouTube connection and the Save "
+        "playlist, and optionally add one video to it.",
+        epilog="An id that starts with '-' goes after '--', e.g. "
+        "python youtube_playlist.py -- -abcdefghij",
+    )
+    parser.add_argument(
+        "video_id", nargs="?",
+        help="a video id to add to the playlist (11 characters, e.g. dQw4w9WgXcQ)",
+    )
+    args = parser.parse_args(argv)
+    # Spelled out, not \w: that also matches non-ASCII letters and digits.
+    if args.video_id is not None and not re.fullmatch(r"[A-Za-z0-9_-]{11}", args.video_id):
+        parser.error(f"{args.video_id!r} isn't a YouTube video id (11 characters).")
+    return args
+
+
 def main(argv=None):
     import sys
 
+    args = parse_args(argv)
+    # Output piped or redirected on Windows uses the ANSI code page, which has
+    # no emoji: show "?" instead of crashing on the first status line.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="replace")
     logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
-    args = sys.argv[1:] if argv is None else argv
 
     try:
         creds = _load_credentials()
@@ -372,8 +399,8 @@ def main(argv=None):
     print(f"   {playlist_url(playlist_id)}")
     print("   (It's private — find it under Library → Playlists on YouTube.)")
 
-    if args:
-        video_id = args[0]
+    if args.video_id:
+        video_id = args.video_id
         try:
             result = add_video(video_id)
         except (NotAuthorized, YouTubeError) as exc:

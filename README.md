@@ -145,6 +145,8 @@ Send the bot:
   registered; a `/start` from any other chat is refused, so a stranger who
   finds your bot can't redirect it. To move it yourself, set
   `TELEGRAM_CHAT_ID` (or clear `notify_chat_id` in `archive.json`) and restart.
+  In a group or channel, every member reads the notifications, but the
+  commands and buttons answer only the chat's admins.
 - **`/check`** — check the channels right now instead of waiting for the timer.
 - **`/except`** — opt a channel out, right from the chat. The bot asks for the
   channel (send a name, @handle, URL, or `UC…` id), matches it against your

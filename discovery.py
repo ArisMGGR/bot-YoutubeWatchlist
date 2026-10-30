@@ -76,6 +76,22 @@ _RULE_KEYWORDS = {
 _URL_QUERY_RE = re.compile(r"\?\S*")
 
 
+def _read_exceptions_text(path, errors):
+    """The exceptions file as text. It's hand-edited, so a BOM or a byte from
+    a non-UTF-8 editor (Windows "ANSI") must not stop every check: an
+    undecodable file is logged and decoded with `errors` instead."""
+    with open(path, "rb") as f:
+        raw = f.read()
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        log.warning(
+            "%s isn't UTF-8 (%s) - reading it anyway; save it as UTF-8 so "
+            "non-ASCII names stay intact.", path, exc,
+        )
+        return raw.decode("utf-8-sig", errors=errors)
+
+
 def parse_exceptions_file(path):
     """Read per-channel notification opt-outs.
 
@@ -96,28 +112,29 @@ def parse_exceptions_file(path):
     rules = []
     # utf-8-sig: a BOM from a Windows editor would otherwise glue itself to the
     # first line's channel and make it unresolvable (config.py does the same).
-    with open(path, encoding="utf-8-sig") as f:
-        for raw in f:
-            # Strip inline (and whole-line) `#` comments. Channel refs never
-            # contain `#`, so this lets bot-written lines carry a `# Name` label.
-            # Drop URL query strings too: YouTube's share links end in
-            # `?si=...`, whose `=` would otherwise be read as the rule's.
-            line = _URL_QUERY_RE.sub("", raw.split("#", 1)[0]).strip()
-            if not line:
-                continue
-            channel, sep, rhs = line.partition("=")
-            channel = channel.strip()
-            if not channel:
-                continue
-            keyword = rhs.strip().lower()
-            rule = _RULE_KEYWORDS.get(keyword)
-            if rule is None:
-                log.warning(
-                    "exceptions.txt: unknown rule %r for %s — muting the channel.",
-                    rhs.strip(), channel,
-                )
-                rule = MUTE
-            rules.append((channel, rule))
+    # "replace": a stray non-UTF-8 byte (usually in a comment) costs at most
+    # its own line, not every check.
+    for raw in _read_exceptions_text(path, errors="replace").splitlines():
+        # Strip inline (and whole-line) `#` comments. Channel refs never
+        # contain `#`, so this lets bot-written lines carry a `# Name` label.
+        # Drop URL query strings too: YouTube's share links end in
+        # `?si=...`, whose `=` would otherwise be read as the rule's.
+        line = _URL_QUERY_RE.sub("", raw.split("#", 1)[0]).strip()
+        if not line:
+            continue
+        channel, sep, rhs = line.partition("=")
+        channel = channel.strip()
+        if not channel:
+            continue
+        keyword = rhs.strip().lower()
+        rule = _RULE_KEYWORDS.get(keyword)
+        if rule is None:
+            log.warning(
+                "exceptions.txt: unknown rule %r for %s — muting the channel.",
+                rhs.strip(), channel,
+            )
+            rule = MUTE
+        rules.append((channel, rule))
     return rules
 
 
@@ -204,10 +221,11 @@ def set_exception(path, channel_id, rule, title=None):
     else:
         new_line = f"{channel_id} = {rule}{comment}"
 
+    # "surrogateescape" here (and on the write below): bytes that aren't UTF-8
+    # are written back exactly as they were, not replaced.
     lines = []
     if os.path.exists(path):
-        with open(path, encoding="utf-8-sig") as f:
-            lines = f.read().splitlines()
+        lines = _read_exceptions_text(path, errors="surrogateescape").splitlines()
 
     for i, raw in enumerate(lines):
         stripped = raw.split("#", 1)[0].strip()
@@ -223,7 +241,7 @@ def set_exception(path, channel_id, rule, title=None):
         outcome = "added"
 
     tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
+    with open(tmp, "w", encoding="utf-8", errors="surrogateescape") as f:
         f.write("\n".join(lines) + "\n")
     os.replace(tmp, path)
     return outcome

@@ -78,6 +78,16 @@ def test_dotenv_repeated_key_last_wins(tmp_path, monkeypatch):
     assert os.environ["X_KEY"] == "real"
 
 
+def test_dotenv_skips_a_line_without_a_key(tmp_path, monkeypatch):
+    """Regression (F-084): a `=value` line was passed to os.environ with an
+    empty name, and the ValueError stopped every entry point at import."""
+    p = tmp_path / "conf.env"
+    p.write_text("=oops\n  = also\nX_KEY=kept\n", encoding="utf-8")
+    monkeypatch.delenv("X_KEY", raising=False)
+    config._load_dotenv(str(p))
+    assert os.environ["X_KEY"] == "kept"
+
+
 def test_empty_path_setting_means_default(monkeypatch):
     """Regression (F-018): `ARCHIVE_FILE=` resolved to the code folder itself."""
     monkeypatch.setenv("SOME_FILE", "  ")
@@ -135,6 +145,30 @@ def test_save_is_atomic_and_round_trips(tmp_path):
     archive.save(path, data)
     assert not os.path.exists(path + ".tmp")
     assert archive.load(path)["seen"]["v1"]["channel_id"] == "UC1"
+
+    # Regression (F-083): no .tmp left over is also true of a write in place,
+    # so make a save fail midway and require the previous archive intact. A
+    # lone surrogate can't be encoded, so json.dump raises while writing.
+    broken = archive.load(path)
+    broken["seen"]["v2"] = {"title": "\ud800", "channel": "c", "channel_id": "UC1"}
+    with pytest.raises(UnicodeEncodeError):
+        archive.save(path, broken)
+    assert list(archive.load(path)["seen"]) == ["v1"]
+
+
+def test_archive_with_a_bom_is_read(tmp_path, caplog):
+    """Regression (F-080): archive.json was read as strict UTF-8, so a BOM
+    from a Windows editor (the README says to hand-edit it) silently reset the
+    whole archive, and a non-UTF-8 byte crashed the bot at startup."""
+    path = tmp_path / "a.json"
+    path.write_text('{"channels": ["UC1"], "notify_chat_id": "5"}', encoding="utf-8-sig")
+    data = archive.load(str(path))
+    assert data["channels"] == ["UC1"] and data["notify_chat_id"] == "5"
+
+    path.write_bytes(b'{"channels": ["Caf\xe9"]}')  # cp1252, not UTF-8
+    with caplog.at_level("WARNING"):
+        assert archive.load(str(path))["channels"] == []
+    assert "Couldn't read" in caplog.text
 
 
 def test_save_check_keeps_notify_target_registered_meanwhile(tmp_path):

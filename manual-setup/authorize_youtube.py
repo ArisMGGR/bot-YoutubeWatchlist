@@ -43,7 +43,7 @@ in Telegram/Discord — it runs this same device flow from the chat.
 import argparse
 import os
 import sys
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 # This script lives in manual-setup/; the bot's modules are one level up.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -109,7 +109,9 @@ def _extract_code(raw):
             )
         values = params.get("code")
         return values[0] if values else None
-    return raw
+    # A bare value copied out of the address bar can still be URL-encoded
+    # (`4%2F0A...`); parse_qs decodes the other two forms, so match it.
+    return unquote(raw)
 
 
 def _authorize_console(flow):
@@ -228,6 +230,11 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
+    # Output piped or redirected on Windows uses the ANSI code page, which has
+    # no emoji: show "?" instead of crashing on "✅ Saved" after the token is
+    # already written.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="replace")
     force_console = args.console
     use_device = args.device
 
