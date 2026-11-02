@@ -148,6 +148,31 @@ def test_authorize_script_rejects_unknown_flags(capsys):
     assert authorize_youtube.parse_args(["--device"]).device
 
 
+def test_authorize_script_knows_when_there_is_no_browser(monkeypatch):
+    """Regression (F-098): headless detection was untested, so ignoring an SSH
+    session (the browser flow then waits forever for a localhost redirect
+    that can't arrive) passed every test."""
+    import authorize_youtube
+
+    for name in ("DISPLAY", "WAYLAND_DISPLAY", "SSH_CONNECTION", "SSH_TTY"):
+        monkeypatch.delenv(name, raising=False)
+
+    def headless(platform, **env):
+        monkeypatch.setattr(authorize_youtube.sys, "platform", platform)
+        for name in ("DISPLAY", "SSH_CONNECTION", "SSH_TTY"):
+            monkeypatch.delenv(name, raising=False)
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        return authorize_youtube._looks_headless()
+
+    assert headless("darwin", SSH_CONNECTION="1.2.3.4 5 6.7.8.9 22")
+    assert headless("win32", SSH_TTY="/dev/pts/0")
+    assert headless("linux")                         # a bare Linux console
+    assert not headless("linux", DISPLAY=":0")       # a desktop, or X forwarding
+    assert not headless("linux", DISPLAY=":0", SSH_CONNECTION="x")
+    assert not headless("win32") and not headless("darwin")
+
+
 def test_authorize_bare_pasted_code_is_url_decoded():
     """Regression (F-086): the full URL and `code=...` forms were decoded by
     parse_qs, but a bare code copied out of the address bar (`4%2F0A...`)

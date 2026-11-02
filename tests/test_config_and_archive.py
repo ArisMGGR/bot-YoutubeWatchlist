@@ -88,6 +88,19 @@ def test_dotenv_skips_a_line_without_a_key(tmp_path, monkeypatch):
     assert os.environ["X_KEY"] == "kept"
 
 
+def test_token_falls_back_to_its_file(tmp_path, monkeypatch):
+    """Regression (F-102): the token.txt / discord_token.txt fallback the README
+    documents was untested, so ignoring the file (the bot then can't start)
+    passed every test."""
+    monkeypatch.setattr(config, "HERE", str(tmp_path))
+    monkeypatch.delenv("X_TOKEN", raising=False)
+    assert config._load_token("X_TOKEN", "token.txt") == ""
+    (tmp_path / "token.txt").write_bytes(b"\xef\xbb\xbf  123:abc \r\n")
+    assert config._load_token("X_TOKEN", "token.txt") == "123:abc"
+    monkeypatch.setenv("X_TOKEN", "from-env")
+    assert config._load_token("X_TOKEN", "token.txt") == "from-env"
+
+
 def test_empty_path_setting_means_default(monkeypatch):
     """Regression (F-018): `ARCHIVE_FILE=` resolved to the code folder itself."""
     monkeypatch.setenv("SOME_FILE", "  ")

@@ -256,6 +256,11 @@ def test_discord_admin_of_another_server_cannot_take_over(monkeypatch):
     assert gone.may_register(_Interaction(9, _Perms(manage_guild=True), HOME_GUILD))
     # Nothing recorded (legacy archive) and no DISCORD_GUILD_ID: nobody moves it.
     assert not _client("5", channel_guild=None).may_register(outsider)
+    # ...but DISCORD_GUILD_ID names the home server (regression, F-099).
+    monkeypatch.setattr(discordbot.config, "DISCORD_GUILD_ID", str(HOME_GUILD))
+    legacy = _client("5", channel_guild=None)
+    assert legacy.may_register(_Interaction(9, _Perms(manage_guild=True), HOME_GUILD))
+    assert not legacy.may_register(outsider)
 
 
 @needs_telegram
@@ -1044,6 +1049,297 @@ def test_discord_owner_can_save_and_delete(monkeypatch):
     assert "Added" in save.followup.sent[0]
     delete = click(f"{discordbot.CB_DELETE}dQw4w9WgXcQ")
     assert delete.message.deleted and delete.followup.sent == []
+
+
+@needs_discord
+def test_discord_save_is_acknowledged_before_asking_youtube(monkeypatch):
+    """Regression (F-104): the owner's Save test stubbed defer() as a no-op,
+    so answering the click only after YouTube (Discord expires it after 3
+    seconds) passed."""
+    monkeypatch.setattr(discordbot.config, "DISCORD_CHANNEL_ID", "")
+    events = []
+    monkeypatch.setattr(discordbot.youtube_playlist, "add_video",
+                        lambda vid: events.append("youtube") or "added")
+    client = discordbot.WatchlistClient()
+    client.notify_channel_id = "5"
+
+    class _Resp(_Response):
+        async def defer(self, **kw):
+            events.append("ack")
+
+    class _Message:
+        async def edit(self, **kw):
+            pass
+
+    i = _Interaction(5, _Perms(manage_guild=True), HOME_GUILD)
+    i.response, i.followup = _Resp(), _Followup()
+    i.type = discordbot.discord.InteractionType.component
+    i.data = {"custom_id": f"{discordbot.CB_SAVE}dQw4w9WgXcQ"}
+    i.message = _Message()
+    asyncio.run(client.on_interaction(i))
+    assert events == ["ack", "youtube"]
+
+
+# --- /except saving --------------------------------------------------------- #
+_SUB = {"id": "UC" + "a" * 22, "title": "Some <Channel>"}
+
+
+@needs_telegram
+@pytest.mark.parametrize("choice,line", [
+    ("videos", f"{_SUB['id']} = videos  # Some <Channel>"),
+    ("livestreams", f"{_SUB['id']} = livestreams  # Some <Channel>"),
+    ("mute", f"{_SUB['id']}  # Some <Channel>"),
+])
+def test_telegram_except_button_writes_the_chosen_rule(monkeypatch, tmp_path, choice, line):
+    """Regression (F-091): the type buttons were never tapped in a test, so a
+    swapped rule map, or a reply of "Added" with nothing written, passed."""
+    exc = tmp_path / "exceptions.txt"
+    monkeypatch.setattr(tgbot.config, "EXCEPTIONS_FILE", str(exc))
+
+    class _Query:
+        data = f"{tgbot.CB_EXCEPT}{choice}"
+
+        def __init__(self):
+            self.edits = []
+
+        async def answer(self, *a, **k):
+            pass
+
+        async def edit_message_text(self, text, **kw):
+            self.edits.append(text)
+
+    q = _Query()
+    ctx = _Ctx("111")
+    ctx.user_data = {"exc_channel": dict(_SUB)}
+    upd = type("U", (), {"callback_query": q})()
+    assert asyncio.run(tgbot.except_type(upd, ctx)) == tgbot.ConversationHandler.END
+    assert exc.read_text(encoding="utf-8").splitlines() == [line]
+    assert q.edits[0].startswith("✅ Added: <b>Some &lt;Channel&gt;</b>")
+
+
+@needs_discord
+@pytest.mark.parametrize("choice,line", [
+    ("videos", f"{_SUB['id']} = videos  # Some <Channel>"),
+    ("livestreams", f"{_SUB['id']} = livestreams  # Some <Channel>"),
+    ("mute", f"{_SUB['id']}  # Some <Channel>"),
+])
+def test_discord_except_writes_the_chosen_rule(monkeypatch, tmp_path, choice, line):
+    """Regression (F-091): the Discord side of the same gap."""
+    exc = tmp_path / "exceptions.txt"
+    monkeypatch.setattr(discordbot.config, "EXCEPTIONS_FILE", str(exc))
+    monkeypatch.setattr(discordbot.config, "DISCORD_CHANNEL_ID", "")
+    monkeypatch.setattr(discordbot.discovery, "lookup_subscription", lambda text: [dict(_SUB)])
+    client = discordbot.WatchlistClient()
+    client.notify_channel_id = "5"
+    discordbot._register_commands(client)
+
+    class _Resp(_Response):
+        async def defer(self, **kw):
+            pass
+
+    i = _Interaction(5, _Perms(manage_guild=True), HOME_GUILD)
+    i.response, i.followup = _Resp(), _Followup()
+    rule = discordbot.app_commands.Choice(name=choice, value=choice)
+    asyncio.run(client.tree.get_command("except").callback(i, "Some Channel", rule))
+    assert exc.read_text(encoding="utf-8").splitlines() == [line]
+    assert i.followup.sent[0].startswith("✅ Added:")
+
+
+# --- What a notification looks like ------------------------------------------ #
+_VIDEO = {
+    "video_id": "dQw4w9WgXcQ", "title": "Fish & <Chips> *now*", "channel_title": "Chan",
+    "link": "https://www.youtube.com/watch?v=dQw4w9WgXcQ", "type": "video",
+    "published": "2026-07-20T18:00:00+00:00",
+}
+
+
+@needs_telegram
+def test_telegram_notifications_carry_link_buttons_and_escaped_text():
+    """Regression (F-092): no test looked at a sent notification, so losing the
+    link, a Save button that deletes, an unescaped title (Telegram rejects the
+    HTML) or a silent set-up message all passed."""
+    sent = []
+
+    class _Bot:
+        async def send_message(self, chat_id=None, text=None, **kw):
+            sent.append((chat_id, text, kw))
+
+    app = type("A", (), {"bot": _Bot(), "bot_data": {"notify_chat_id": "111"}})()
+    notifier = tgbot.TelegramNotifier(app)
+    asyncio.run(notifier.send_video(dict(_VIDEO)))
+    chat_id, text, kw = sent[0]
+    assert chat_id == "111" and kw["parse_mode"] == tgbot.ParseMode.HTML
+    assert text.splitlines()[-1] == _VIDEO["link"]
+    assert "<b>Fish &amp; &lt;Chips&gt; *now*</b>" in text
+    save, delete = kw["reply_markup"].inline_keyboard[0]
+    assert save.callback_data == f"{tgbot.CB_SAVE}dQw4w9WgXcQ"
+    assert delete.callback_data == f"{tgbot.CB_DELETE}dQw4w9WgXcQ"
+    asyncio.run(notifier.send_first_run(7))
+    assert sent[1][0] == "111" and "Watching <b>7</b> channel(s)" in sent[1][1]
+
+
+@needs_discord
+def test_discord_notifications_carry_link_buttons_and_escaped_text():
+    """Regression (F-092): the Discord side of the same gap."""
+    sent = []
+
+    class _Channel:
+        async def send(self, text, **kw):
+            sent.append((text, kw))
+
+    client = type("C", (), {"notify_channel_id": "5",
+                            "get_channel": staticmethod(lambda cid: _Channel())})()
+    notifier = discordbot.DiscordNotifier(client)
+    asyncio.run(notifier.send_video(dict(_VIDEO)))
+    text, kw = sent[0]
+    assert text.splitlines()[-1] == _VIDEO["link"]
+    assert "**Fish & <Chips> \\*now\\***" in text
+    assert [b.custom_id for b in kw["view"].children] == [
+        f"{discordbot.CB_SAVE}dQw4w9WgXcQ", f"{discordbot.CB_DELETE}dQw4w9WgXcQ"]
+    asyncio.run(notifier.send_first_run(7))
+    assert "Watching **7** channel(s)" in sent[1][0]
+
+
+@needs_telegram
+def test_telegram_status_messages_are_sent_and_escaped():
+    """Regression (F-093): the "now watching" list and the re-authorize alert
+    were never looked at, so a no-op send or an unescaped name (Telegram
+    rejects the HTML) passed every test."""
+    sent = []
+
+    class _Bot:
+        async def send_message(self, chat_id=None, text=None, **kw):
+            sent.append((chat_id, text, kw.get("parse_mode")))
+
+    app = type("A", (), {"bot": _Bot(), "bot_data": {"notify_chat_id": "111"}})()
+    notifier = tgbot.TelegramNotifier(app)
+    asyncio.run(notifier.send_seeded(["A <b>", "B & C"]))
+    asyncio.run(notifier.send_auth_alert("token <dead>"))
+    (c1, seeded, m1), (c2, alert, m2) = sent
+    assert c1 == c2 == "111" and m1 == m2 == tgbot.ParseMode.HTML
+    assert "Now watching 2 new channel(s)" in seeded
+    assert "• A &lt;b&gt;" in seeded and "• B &amp; C" in seeded
+    assert "re-authorizing" in alert and "token &lt;dead&gt;" in alert
+
+
+@needs_discord
+def test_discord_status_messages_are_sent():
+    """Regression (F-093): the Discord side of the same gap."""
+    sent = []
+
+    class _Channel:
+        async def send(self, text, **kw):
+            sent.append(text)
+
+    client = type("C", (), {"notify_channel_id": "5",
+                            "get_channel": staticmethod(lambda cid: _Channel())})()
+    notifier = discordbot.DiscordNotifier(client)
+    asyncio.run(notifier.send_seeded(["A_b", "C"]))
+    asyncio.run(notifier.send_auth_alert("token *dead*"))
+    seeded, alert = sent
+    assert "Now watching 2 new channel(s)" in seeded and "• A\\_b" in seeded
+    assert "re-authorizing" in alert and "token \\*dead\\*" in alert
+
+
+# --- /except: which channel ------------------------------------------------- #
+def test_find_subscriptions_prefers_the_exact_title():
+    """Regression (F-094): without the exact-title pass, "Ch1" also matched
+    "Ch10", so /except could never pick Ch1."""
+    import discovery
+
+    subs = [{"id": "UC1", "title": "Ch1"}, {"id": "UC10", "title": "Ch10"}]
+    assert discovery.find_subscriptions("ch1", subs) == [subs[0]]
+    assert discovery.find_subscriptions("Ch", subs) == subs
+
+
+@needs_telegram
+def test_telegram_except_remembers_the_matched_channel(monkeypatch):
+    """Regression (F-094): the single-match path was untested, so forgetting
+    the matched channel (the next button tap then says "Cancelled") passed."""
+    monkeypatch.setattr(tgbot.discovery, "lookup_subscription", lambda text: [dict(_SUB)])
+    ctx, upd = _Ctx("111"), _Update(111, text="Some Channel")
+    ctx.user_data = {}
+    assert asyncio.run(tgbot.except_channel(upd, ctx)) == tgbot.EXC_TYPE
+    assert ctx.user_data["exc_channel"] == _SUB
+    assert "Some &lt;Channel&gt;" in upd.message.replies[0]
+    assert upd.message.kwargs[0]["reply_markup"] is not None
+
+
+# --- A pinned notify target wins at startup --------------------------------- #
+@needs_telegram
+def test_telegram_pinned_chat_wins_at_startup(monkeypatch, archive_path):
+    """Regression (F-095): post_init's choice between TELEGRAM_CHAT_ID and the
+    chat /start stored was untested, so ignoring the setting passed."""
+    import archive
+
+    archive.set_keys(str(archive_path), notify_chat_id="7")
+    monkeypatch.setattr(tgbot.youtube_playlist, "is_configured", lambda: False)
+
+    def app():
+        return type("A", (), {"bot_data": {}, "create_task": lambda self, coro: coro.close()})()
+
+    monkeypatch.setattr(tgbot.config, "TELEGRAM_CHAT_ID", "42")
+    pinned = app()
+    asyncio.run(tgbot.post_init(pinned))
+    assert pinned.bot_data["notify_chat_id"] == "42"
+    monkeypatch.setattr(tgbot.config, "TELEGRAM_CHAT_ID", "")
+    learned = app()
+    asyncio.run(tgbot.post_init(learned))
+    assert learned.bot_data["notify_chat_id"] == "7"
+
+
+@needs_discord
+def test_discord_pinned_channel_wins_at_startup(monkeypatch, archive_path):
+    """Regression (F-095): the Discord side of the same gap (setup_hook)."""
+    import archive
+
+    archive.set_keys(str(archive_path), discord_channel_id="9")
+    monkeypatch.setattr(discordbot.config, "DISCORD_GUILD_ID", "")
+
+    async def sync(*, guild=None):
+        pass
+
+    for pinned, expected in (("5", "5"), ("", "9")):
+        monkeypatch.setattr(discordbot.config, "DISCORD_CHANNEL_ID", pinned)
+        client = discordbot.WatchlistClient()
+        client.tree.sync = sync
+        asyncio.run(client.setup_hook())
+        assert client.notify_channel_id == expected
+
+
+# --- The periodic check starts once ----------------------------------------- #
+@needs_telegram
+def test_telegram_startup_starts_the_check_loop(monkeypatch, archive_path):
+    """Regression (F-101): nothing checked that post_init starts the periodic
+    check, so dropping it (the bot then never checks) passed."""
+    monkeypatch.setattr(tgbot.youtube_playlist, "is_configured", lambda: False)
+    started = []
+    app = type("A", (), {"bot_data": {},
+                         "create_task": lambda self, coro: started.append(coro)})()
+    asyncio.run(tgbot.post_init(app))
+    assert [c.cr_code.co_name for c in started] == ["check_loop"]
+    started[0].close()
+
+
+@needs_discord
+def test_discord_starts_one_check_loop_across_reconnects(monkeypatch):
+    """Regression (F-101): on_ready fires again after every reconnect; nothing
+    checked that it starts the loop, or that it starts it only once."""
+    monkeypatch.setattr(discordbot.youtube_playlist, "is_configured", lambda: True)
+    started = []
+
+    class _Loop:
+        def create_task(self, coro):
+            started.append(coro)
+            return coro
+
+    client = discordbot.WatchlistClient()
+    client.loop = _Loop()
+    client.notify_channel_id = "5"
+    asyncio.run(client.on_ready())
+    asyncio.run(client.on_ready())  # a reconnect
+    assert [c.cr_code.co_name for c in started] == ["check_loop"]
+    started[0].close()
 
 
 def test_add_video_is_idempotent(monkeypatch, tmp_path):

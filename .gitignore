@@ -53,6 +53,7 @@ manual-setup/deploy/youtube-watchlist-bot.service
 tests/FINDINGS.md
 tests/LOG.md
 tests/VERIFY.md
+tests/PASSES.md
 
 # Windows (development machine)
 Thumbs.db

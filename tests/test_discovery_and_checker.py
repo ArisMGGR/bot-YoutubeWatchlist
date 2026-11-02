@@ -328,6 +328,44 @@ def test_add_video_recreates_a_deleted_playlist(monkeypatch, tmp_path):
     assert youtube_playlist._read_playlist_id() == "PL_new"
 
 
+def test_playlist_lookup_reads_every_page(monkeypatch):
+    """Regression (F-097): the playlist search was only tested on one page;
+    stopping there would create a duplicate playlist for anyone with more
+    than 50."""
+    page1 = {"items": [{"id": f"PL{i}", "snippet": {"title": f"P{i}"}} for i in range(50)],
+             "nextPageToken": "p2"}
+    page2 = {"items": [{"id": "PL_mine", "snippet": {"title": "Watchlist"}}]}
+    api = _YouTubeAPI(monkeypatch, {("GET", "playlists"): [(200, page1), (200, page2)]})
+    creds = type("Creds", (), {"token": "t"})()
+    assert youtube_playlist._find_playlist_by_name(creds, "Watchlist") == "PL_mine"
+    assert [c[2].get("pageToken") for c in api.calls] == [None, "p2"]
+
+
+def test_refreshed_token_is_saved(monkeypatch, tmp_path):
+    """Regression (F-097): nothing checked that a refreshed token is written
+    back, so dropping that write passed (every later call refreshed again)."""
+    pytest.importorskip("google.oauth2.credentials")
+    import json as _json
+    from google.oauth2.credentials import Credentials
+
+    token = tmp_path / "youtube_token.json"
+    token.write_text(
+        '{"token": "old", "refresh_token": "r", "client_id": "c", '
+        '"client_secret": "s", "expiry": "2000-01-01T00:00:00Z"}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config, "YOUTUBE_TOKEN_FILE", str(token))
+
+    def refreshed(self, request):
+        self.token = "new"
+        self.expiry = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=1)
+
+    monkeypatch.setattr(Credentials, "refresh", refreshed)
+    assert youtube_playlist._load_credentials().token == "new"
+    saved = _json.loads(token.read_text(encoding="utf-8"))
+    assert saved["token"] == "new" and saved["refresh_token"] == "r"
+
+
 # --- collect_new_videos + run_check ----------------------------------------- #
 FRESH = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
 
@@ -383,6 +421,33 @@ def test_first_check_seeds_then_only_new_videos_are_sent(offline, monkeypatch, a
     asyncio.run(checker.run_check(notifier, {}))
     assert notifier.sent == [("video", "brand-new")]
     assert archive.load(str(archive_path))["seen"]["brand-new"]["channel_id"] == subs[0]["id"]
+
+
+def test_check_loop_survives_a_failed_check_and_waits_between_checks(monkeypatch, notifier):
+    """Regression (F-100): the periodic loop never ran in a test, so letting
+    one failed check end it, or dropping the wait between checks, passed."""
+    class _Stop(Exception):
+        pass
+
+    runs, sleeps = [], []
+
+    async def run_check(n, state, *, trigger="scheduled"):
+        runs.append(trigger)
+        if len(runs) == 1:
+            raise RuntimeError("YouTube hiccup")
+
+    async def sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) == 4:
+            raise _Stop
+
+    monkeypatch.setattr(checker, "run_check", run_check)
+    monkeypatch.setattr(checker.asyncio, "sleep", sleep)
+    monkeypatch.setattr(config, "CHECK_INTERVAL_MINUTES", 30)
+    with pytest.raises(_Stop):
+        asyncio.run(checker.check_loop(notifier, {}))
+    assert runs == ["scheduled"] * 3  # the failed first check didn't end it
+    assert sleeps == [5, 1800, 1800, 1800]
 
 
 def test_overlapping_checks_work_in_more_than_one_event_loop(offline, monkeypatch, archive_path, notifier):

@@ -24,6 +24,20 @@ def test_ask_number_rejects_negative_then_accepts(monkeypatch):
     assert setup_bot.ask_number("n", "3", int) == "2"
 
 
+def test_requirement_lines_install_only_the_chosen_backend():
+    """Regression (F-096): the per-platform filter was untested, so skipping
+    the chosen library instead of the other one (the bot then can't start)
+    passed every test."""
+    def names(platform, all_backends=False):
+        return {line.split(">")[0].split("<")[0].split("=")[0]
+                for line in setup_bot.requirement_lines(platform, all_backends)}
+
+    shared = {"requests", "google-auth", "google-auth-oauthlib"}
+    assert names("telegram") == shared | {"python-telegram-bot"}
+    assert names("discord") == shared | {"discord.py"}
+    assert names("telegram", True) == shared | {"python-telegram-bot", "discord.py"}
+
+
 def test_read_conf_tolerates_bom(tmp_path):
     p = tmp_path / "conf.env"
     p.write_bytes(b"\xef\xbb\xbfTELEGRAM_BOT_TOKEN=t\n# X=1\nY = 'q'\n=no key\n")
@@ -156,6 +170,19 @@ def test_write_conf_carries_unknown_keys(tmp_path, monkeypatch):
     assert got["TELEGRAM_BOT_TOKEN"] == "t"
     assert got["YOUTUBE_DEVICE_CLIENT_SECRET_FILE"] == "dev.json"
     assert "CHECK_INTERVAL_MINUTES" not in got  # at default -> commented out
+
+
+def test_rewrite_keeps_the_previous_conf_as_a_backup(tmp_path, monkeypatch):
+    """Regression (F-103): only a POSIX-only test reached write_conf's backup,
+    so on Windows dropping it (the old conf.env then lost) passed."""
+    conf = tmp_path / "conf.env"
+    original = "TELEGRAM_BOT_TOKEN=old\nCUSTOM=1\n"
+    conf.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(setup_bot, "CONF", conf)
+    monkeypatch.setattr(setup_bot, "say", lambda m="": None)
+    setup_bot.write_conf("telegram", {"TELEGRAM_BOT_TOKEN": "new"})
+    assert (tmp_path / "conf.env.bak").read_text(encoding="utf-8") == original
+    assert setup_bot.read_conf(conf)["TELEGRAM_BOT_TOKEN"] == "new"
 
 
 def test_configured_platform_reads_token_files(monkeypatch, tmp_path):
