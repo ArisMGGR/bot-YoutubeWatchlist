@@ -105,9 +105,12 @@ if [[ ! -f "${TEMPLATE}" ]]; then
 fi
 
 # --- Non-blocking sanity warning --------------------------------------------
-if [[ ! -f "${PROJECT_DIR}/conf.env" ]]; then
-  echo "WARNING: ${PROJECT_DIR}/conf.env not found — the bot needs TELEGRAM_BOT_TOKEN."
-  echo "         Installing anyway; the service will crash-loop until you add it."
+# The bot reads its token (Telegram or Discord) from conf.env, or from
+# token.txt / discord_token.txt next to the code, and exits without one.
+if [[ ! -f "${PROJECT_DIR}/conf.env" && ! -f "${PROJECT_DIR}/token.txt" \
+      && ! -f "${PROJECT_DIR}/discord_token.txt" ]]; then
+  echo "WARNING: no bot token found — no conf.env, token.txt or discord_token.txt in ${PROJECT_DIR}."
+  echo "         Installing anyway; the service will crash-loop until you add one."
 fi
 
 # --- Render the unit from the template --------------------------------------

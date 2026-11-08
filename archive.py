@@ -11,8 +11,11 @@ lets a newly subscribed channel be seeded silently instead of dumping its whole
 back-catalogue into your chat.
 """
 import json
+import logging
 import os
 import threading
+
+log = logging.getLogger("ytwatchlistbot.archive")
 
 # Held around every read-modify-write of the archive file. A check keeps its
 # own loaded copy for minutes while /start may persist the notify target from
@@ -27,10 +30,16 @@ NOTIFY_KEYS = ("notify_chat_id", "discord_channel_id", "discord_guild_id")
 def load(path):
     data = {}
     if os.path.exists(path):
+        # utf-8-sig: the README tells you to hand-edit this file, and a BOM
+        # from a Windows editor would otherwise make it unreadable.
         try:
-            with open(path, encoding="utf-8") as f:
+            with open(path, encoding="utf-8-sig") as f:
                 data = json.load(f)
-        except (json.JSONDecodeError, OSError):
+        except (ValueError, OSError) as exc:  # bad JSON, bad encoding, unreadable
+            log.warning(
+                "Couldn't read %s (%s) - starting from an empty archive; the "
+                "next save replaces it.", path, exc,
+            )
             data = {}
     if not isinstance(data, dict):
         data = {}

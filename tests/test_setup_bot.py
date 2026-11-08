@@ -24,9 +24,23 @@ def test_ask_number_rejects_negative_then_accepts(monkeypatch):
     assert setup_bot.ask_number("n", "3", int) == "2"
 
 
+def test_requirement_lines_install_only_the_chosen_backend():
+    """Regression (F-096): the per-platform filter was untested, so skipping
+    the chosen library instead of the other one (the bot then can't start)
+    passed every test."""
+    def names(platform, all_backends=False):
+        return {line.split(">")[0].split("<")[0].split("=")[0]
+                for line in setup_bot.requirement_lines(platform, all_backends)}
+
+    shared = {"requests", "google-auth", "google-auth-oauthlib"}
+    assert names("telegram") == shared | {"python-telegram-bot"}
+    assert names("discord") == shared | {"discord.py"}
+    assert names("telegram", True) == shared | {"python-telegram-bot", "discord.py"}
+
+
 def test_read_conf_tolerates_bom(tmp_path):
     p = tmp_path / "conf.env"
-    p.write_bytes(b"\xef\xbb\xbfTELEGRAM_BOT_TOKEN=t\n# X=1\nY = 'q'\n")
+    p.write_bytes(b"\xef\xbb\xbfTELEGRAM_BOT_TOKEN=t\n# X=1\nY = 'q'\n=no key\n")
     assert setup_bot.read_conf(p) == {"TELEGRAM_BOT_TOKEN": "t", "Y": "q"}
 
 
@@ -70,6 +84,31 @@ def test_install_service_writes_paths_with_sed_metacharacters(tmp_path):
     assert f"WorkingDirectory={project}\n" in unit
     assert f"EnvironmentFile=-{project}/conf.env\n" in unit
     assert f'ExecStart="{sys.executable}" ytwatchlistbot.py\n' in unit
+
+
+@pytest.mark.skipif(
+    os.name != "posix" or os.geteuid() == 0
+    or not shutil.which("bash") or not shutil.which("id"),
+    reason="needs a POSIX shell, not as root (the installer refuses User=root)",
+)
+def test_installer_token_warning_knows_the_token_files(tmp_path):
+    """Regression (F-073): with no conf.env the installer said the bot needs
+    TELEGRAM_BOT_TOKEN and will crash-loop, even when its token is in
+    discord_token.txt (which starts fine)."""
+    import getpass
+
+    project = tmp_path / "bot"
+    shutil.copytree(setup_bot.SETUP_DIR / "deploy", project / "manual-setup" / "deploy")
+    script = str(project / "manual-setup" / "deploy" / "install-service.sh")
+    env = dict(os.environ, SERVICE_USER=getpass.getuser(), PYTHON=sys.executable)
+
+    def dry_run():
+        return subprocess.run(["bash", script, "--dry-run"], env=env,
+                              capture_output=True, text=True, check=True).stdout
+
+    assert "WARNING: no bot token found" in dry_run()
+    (project / "discord_token.txt").write_text("d\n", encoding="utf-8")
+    assert "WARNING" not in dry_run()
 
 
 def test_set_conf_key_replaces_a_spaced_active_line(tmp_path, monkeypatch):
@@ -131,6 +170,19 @@ def test_write_conf_carries_unknown_keys(tmp_path, monkeypatch):
     assert got["TELEGRAM_BOT_TOKEN"] == "t"
     assert got["YOUTUBE_DEVICE_CLIENT_SECRET_FILE"] == "dev.json"
     assert "CHECK_INTERVAL_MINUTES" not in got  # at default -> commented out
+
+
+def test_rewrite_keeps_the_previous_conf_as_a_backup(tmp_path, monkeypatch):
+    """Regression (F-103): only a POSIX-only test reached write_conf's backup,
+    so on Windows dropping it (the old conf.env then lost) passed."""
+    conf = tmp_path / "conf.env"
+    original = "TELEGRAM_BOT_TOKEN=old\nCUSTOM=1\n"
+    conf.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(setup_bot, "CONF", conf)
+    monkeypatch.setattr(setup_bot, "say", lambda m="": None)
+    setup_bot.write_conf("telegram", {"TELEGRAM_BOT_TOKEN": "new"})
+    assert (tmp_path / "conf.env.bak").read_text(encoding="utf-8") == original
+    assert setup_bot.read_conf(conf)["TELEGRAM_BOT_TOKEN"] == "new"
 
 
 def test_configured_platform_reads_token_files(monkeypatch, tmp_path):
@@ -310,6 +362,29 @@ def test_service_step_without_sudo_does_not_crash(monkeypatch):
     monkeypatch.setattr(setup_bot, "say", lambda m="": said.append(m))
     assert setup_bot.service_step() is None
     assert ran == [] and any("sudo isn't installed" in m for m in said)
+
+
+def test_setup_survives_a_console_without_box_drawing(monkeypatch):
+    """Regression (F-075): with its output piped or redirected on Windows (the
+    ANSI code page), the first step header ("── Step 1/7") raised
+    UnicodeEncodeError before anything was checked."""
+    import io
+
+    out = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
+    monkeypatch.setattr(setup_bot.sys, "stdout", out)
+    monkeypatch.setattr(setup_bot.sys, "argv", ["setup_bot.py"])
+
+    class Reached(Exception):
+        pass
+
+    def preflight():
+        raise Reached
+
+    monkeypatch.setattr(setup_bot, "preflight", preflight)
+    with pytest.raises(Reached):
+        setup_bot.main()
+    out.flush()
+    assert "? Step 1/7: Checking your environment" in out.buffer.getvalue().decode("cp1252")
 
 
 def test_uninstaller_parses_arguments_before_asking_for_root():

@@ -14,7 +14,9 @@ A notifier must provide:
     async send_auth_alert(reason)       ("re-run manual-setup/authorize_youtube.py")
     describe_error(exc)        -> str   (friendly one-liner, or "")
 
-Any of the send methods may raise; the check survives it and retries next pass.
+Any of the send methods may raise, and the check survives it. A failed video,
+"set up" message or re-authorize alert is retried on the next check; a failed
+"now watching" message is only logged, since its channels are already seeded.
 """
 import asyncio
 import logging

@@ -58,6 +58,25 @@ def test_exceptions_share_link_query_is_not_the_rule(tmp_path):
     ]
 
 
+def test_exceptions_file_that_isnt_utf8_still_works(offline, monkeypatch, archive_path, tmp_path, notifier, caplog):
+    """Regression (F-085): one byte from a non-UTF-8 editor (Windows "ANSI")
+    raised UnicodeDecodeError, so every check failed and /except couldn't
+    save. Now it is logged and read, and /except keeps those bytes as they
+    were."""
+    subs = _subs(2)
+    exc = tmp_path / "exceptions.txt"
+    exc.write_bytes(f"{subs[0]['id']}  # Café\n".encode("cp1252"))
+    monkeypatch.setattr(config, "EXCEPTIONS_FILE", str(exc))
+    monkeypatch.setattr(youtube_playlist, "list_my_subscriptions", lambda: subs)
+    with caplog.at_level("WARNING"):
+        asyncio.run(checker.run_check(notifier, {}))
+    assert notifier.sent == [("first_run", 1)]  # the muted channel stays muted
+    assert "isn't UTF-8" in caplog.text
+    assert discovery.set_exception(str(exc), subs[1]["id"], discovery.ONLY_VIDEOS, "B") == "added"
+    written = exc.read_bytes().replace(b"\r\n", b"\n")  # text mode on Windows
+    assert written == f"{subs[0]['id']}  # Café\n{subs[1]['id']} = videos  # B\n".encode("cp1252")
+
+
 def test_find_subscriptions_blank_matches_nothing():
     """Regression (F-008): blank input substring-matched every title."""
     subs = [{"id": "UC1", "title": "A"}, {"id": "UC2", "title": "B"}]
@@ -129,6 +148,224 @@ def test_get_with_retries_retries_then_succeeds(monkeypatch):
     assert len(calls) == 3
 
 
+# --- youtube.py: feed, Shorts, API labels ----------------------------------- #
+# Everything below the module boundary is stubbed in the check tests, so these
+# run youtube.py itself against canned HTTP answers (F-088).
+_ATOM = b"""<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns:yt="http://www.youtube.com/xml/schemas/2015"
+      xmlns:media="http://search.yahoo.com/mrss/" xmlns="http://www.w3.org/2005/Atom">
+ <title>Some Channel</title>
+ <entry>
+  <id>yt:video:dQw4w9WgXcQ</id>
+  <yt:videoId>dQw4w9WgXcQ</yt:videoId>
+  <yt:channelId>UCxxxxxxxxxxxxxxxxxxxxxx</yt:channelId>
+  <title>A title</title>
+  <link rel="alternate" href="https://www.youtube.com/watch?v=dQw4w9WgXcQ"/>
+  <author><name>Some Channel</name></author>
+  <published>2026-07-20T18:00:00+00:00</published>
+ </entry>
+</feed>"""
+
+
+def test_fetch_channel_feed_parses_youtubes_atom(monkeypatch):
+    """Regression (F-088): the feed parser never ran in a test, so a wrong
+    namespace returned no videos — and no notifications — with the suite green."""
+    class Resp:
+        status_code = 200
+        content = _ATOM
+
+        def raise_for_status(self):
+            pass
+
+    monkeypatch.setattr(youtube.session, "get", lambda url, **kw: Resp())
+    title, videos = youtube.fetch_channel_feed("UCxxxxxxxxxxxxxxxxxxxxxx")
+    assert title == "Some Channel"
+    assert videos == [{
+        "video_id": "dQw4w9WgXcQ", "title": "A title",
+        "link": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        "published": "2026-07-20T18:00:00+00:00", "author": "Some Channel",
+    }]
+
+
+def test_is_short_tells_shorts_from_redirected_videos(monkeypatch):
+    """Regression (F-088): a regular video's /shorts/ URL redirects to /watch,
+    which also answers 200. Following that redirect would call every video a
+    Short and drop it silently."""
+    def head(url, allow_redirects=False, **kw):
+        status = 200 if "SHORTxxxxxx" in url or allow_redirects else 303
+        return type("R", (), {"status_code": status})()
+
+    monkeypatch.setattr(youtube.session, "head", head)
+    assert youtube.is_short("SHORTxxxxxx")
+    assert not youtube.is_short("dQw4w9WgXcQ")
+
+
+def test_api_classification_labels_each_kind(monkeypatch):
+    """Regression (F-088): only the API's error path was tested; its mapping to
+    live / upcoming / ended stream / video was not."""
+    items = [
+        {"id": "live1", "snippet": {"liveBroadcastContent": "live"}, "liveStreamingDetails": {}},
+        {"id": "soon1", "snippet": {"liveBroadcastContent": "upcoming"},
+         "liveStreamingDetails": {"scheduledStartTime": "2026-07-20T18:00:00Z"}},
+        {"id": "ended1", "snippet": {"liveBroadcastContent": "none"},
+         "liveStreamingDetails": {"actualEndTime": "2026-07-19T18:00:00Z"}},
+        {"id": "plain1", "snippet": {"liveBroadcastContent": "none"}},
+    ]
+
+    class Resp:
+        ok = True
+        status_code = 200
+
+        def json(self):
+            return {"items": items}
+
+    monkeypatch.setattr(config, "YOUTUBE_API_KEY", "k")
+    monkeypatch.setattr(youtube.session, "get", lambda *a, **k: Resp())
+    monkeypatch.setattr(youtube, "is_short", lambda vid: False)
+    videos = [{"video_id": i["id"]} for i in items]
+    youtube.classify_videos(videos)
+    assert [v["type"] for v in videos] == ["live", "upcoming", "livestream", "video"]
+    assert videos[1]["scheduled_start"] == "2026-07-20 18:00 UTC"
+
+
+def test_scrape_classification_labels_each_kind(monkeypatch):
+    """Regression (F-089): with no API key every video is labelled from its
+    watch page, and that parser never ran in a test."""
+    pages = {
+        "live1": '"isLiveContent":true,"isLiveNow":true',
+        "soon1": '"isLiveContent":true,"isUpcoming":true',
+        "ended1": '"isLiveContent":true,"isLiveNow":false',
+        "plain1": '"isLiveContent":false',
+    }
+
+    def get(url, **kw):
+        return type("R", (), {"text": pages[url.rsplit("=", 1)[1]]})()
+
+    monkeypatch.setattr(config, "YOUTUBE_API_KEY", "")
+    monkeypatch.setattr(youtube.session, "get", get)
+    monkeypatch.setattr(youtube, "is_short", lambda vid: False)
+    videos = [{"video_id": vid} for vid in pages]
+    youtube.classify_videos(videos)
+    assert [v["type"] for v in videos] == ["live", "upcoming", "livestream", "video"]
+
+
+def test_resolve_channel_id_picks_the_pages_own_channel(monkeypatch):
+    """Regression (F-089): a channel page names other channels too (featured,
+    video owners) before its own canonical link; trying the generic patterns
+    first would put the opt-out on the wrong channel."""
+    own, other = "UC" + "a" * 22, "UC" + "b" * 22
+    page = (f'"channelId":"{other}" <a href="https://www.youtube.com/channel/{other}">'
+            f'<link rel="canonical" href="https://www.youtube.com/channel/{own}">')
+    asked = []
+
+    def get(url, **kw):
+        asked.append(url)
+        return type("R", (), {"status_code": 404 if "gone" in url else 200, "text": page})()
+
+    monkeypatch.setattr(youtube.session, "get", get)
+    assert youtube.resolve_channel_id("@Some") == own
+    assert youtube.resolve_channel_id("Some") == own
+    assert youtube.resolve_channel_id("https://www.youtube.com/c/Some") == own
+    assert youtube.resolve_channel_id("@gone") is None
+    assert asked == ["https://www.youtube.com/@Some"] * 2 + [
+        "https://www.youtube.com/c/Some", "https://www.youtube.com/@gone"]
+    # An id, or a /channel/ link, needs no request.
+    assert youtube.resolve_channel_id(other) == other
+    assert youtube.resolve_channel_id(f"https://youtube.com/channel/{other}?si=x") == other
+    assert len(asked) == 4
+
+
+class _YouTubeAPI:
+    """Canned answers for youtube_playlist's REST calls, by method + path."""
+
+    def __init__(self, monkeypatch, answers):
+        self.answers, self.calls = answers, []
+        monkeypatch.setattr(youtube_playlist, "_load_credentials",
+                            lambda: type("Creds", (), {"token": "t"})())
+        monkeypatch.setattr(youtube_playlist.requests, "request", self.request)
+
+    def request(self, method, url, params=None, json=None, **kw):
+        path = url.rsplit("/", 1)[1]
+        self.calls.append((method, path, dict(params or {}), json))
+        status, body = self.answers[(method, path)].pop(0)
+        resp = type("R", (), {"status_code": status, "content": b"x", "text": str(body)})()
+        resp.json = lambda: body
+        return resp
+
+
+def test_list_my_subscriptions_reads_every_page(monkeypatch):
+    """Regression (F-089): the watchlist comes 50 subscriptions a page; stopping
+    after the first page silently stopped watching everything else."""
+    def page(ids, token=None):
+        items = [{"snippet": {"title": f"T{i}", "resourceId": {"channelId": f"UC{i}"}}} for i in ids]
+        return 200, dict(items=items, **({"nextPageToken": token} if token else {}))
+
+    api = _YouTubeAPI(monkeypatch, {("GET", "subscriptions"): [
+        page(range(50), "p2"), page(range(50, 100), "p3"), page([100])]})
+    subs = youtube_playlist.list_my_subscriptions()
+    assert [s["id"] for s in subs] == [f"UC{i}" for i in range(101)]
+    assert subs[100] == {"id": "UC100", "title": "T100"}
+    assert [c[2].get("pageToken") for c in api.calls] == [None, "p2", "p3"]
+
+
+def test_add_video_recreates_a_deleted_playlist(monkeypatch, tmp_path):
+    """Regression (F-089): a cached playlist deleted on YouTube answers 404;
+    without recreating it every later Save failed."""
+    state = tmp_path / "youtube_state.json"
+    state.write_text('{"playlist_id": "PL_gone", "name": "Watchlist"}', encoding="utf-8")
+    monkeypatch.setattr(config, "YOUTUBE_PLAYLIST_STATE_FILE", str(state))
+    monkeypatch.setattr(config, "YOUTUBE_PLAYLIST_NAME", "Watchlist")
+    gone = {"error": {"message": "Playlist not found", "errors": [{"reason": "playlistNotFound"}]}}
+    api = _YouTubeAPI(monkeypatch, {
+        ("GET", "playlistItems"): [(404, gone), (200, {"items": []})],
+        ("GET", "playlists"): [(200, {"items": [{"id": "PL_other", "snippet": {"title": "Other"}}]})],
+        ("POST", "playlists"): [(200, {"id": "PL_new"})],
+        ("POST", "playlistItems"): [(200, {})],
+    })
+    assert youtube_playlist.add_video("dQw4w9WgXcQ") == "added"
+    assert api.calls[-1][3]["snippet"] == {
+        "playlistId": "PL_new", "resourceId": {"kind": "youtube#video", "videoId": "dQw4w9WgXcQ"}}
+    assert youtube_playlist._read_playlist_id() == "PL_new"
+
+
+def test_playlist_lookup_reads_every_page(monkeypatch):
+    """Regression (F-097): the playlist search was only tested on one page;
+    stopping there would create a duplicate playlist for anyone with more
+    than 50."""
+    page1 = {"items": [{"id": f"PL{i}", "snippet": {"title": f"P{i}"}} for i in range(50)],
+             "nextPageToken": "p2"}
+    page2 = {"items": [{"id": "PL_mine", "snippet": {"title": "Watchlist"}}]}
+    api = _YouTubeAPI(monkeypatch, {("GET", "playlists"): [(200, page1), (200, page2)]})
+    creds = type("Creds", (), {"token": "t"})()
+    assert youtube_playlist._find_playlist_by_name(creds, "Watchlist") == "PL_mine"
+    assert [c[2].get("pageToken") for c in api.calls] == [None, "p2"]
+
+
+def test_refreshed_token_is_saved(monkeypatch, tmp_path):
+    """Regression (F-097): nothing checked that a refreshed token is written
+    back, so dropping that write passed (every later call refreshed again)."""
+    pytest.importorskip("google.oauth2.credentials")
+    import json as _json
+    from google.oauth2.credentials import Credentials
+
+    token = tmp_path / "youtube_token.json"
+    token.write_text(
+        '{"token": "old", "refresh_token": "r", "client_id": "c", '
+        '"client_secret": "s", "expiry": "2000-01-01T00:00:00Z"}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config, "YOUTUBE_TOKEN_FILE", str(token))
+
+    def refreshed(self, request):
+        self.token = "new"
+        self.expiry = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=1)
+
+    monkeypatch.setattr(Credentials, "refresh", refreshed)
+    assert youtube_playlist._load_credentials().token == "new"
+    saved = _json.loads(token.read_text(encoding="utf-8"))
+    assert saved["token"] == "new" and saved["refresh_token"] == "r"
+
+
 # --- collect_new_videos + run_check ----------------------------------------- #
 FRESH = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
 
@@ -184,6 +421,33 @@ def test_first_check_seeds_then_only_new_videos_are_sent(offline, monkeypatch, a
     asyncio.run(checker.run_check(notifier, {}))
     assert notifier.sent == [("video", "brand-new")]
     assert archive.load(str(archive_path))["seen"]["brand-new"]["channel_id"] == subs[0]["id"]
+
+
+def test_check_loop_survives_a_failed_check_and_waits_between_checks(monkeypatch, notifier):
+    """Regression (F-100): the periodic loop never ran in a test, so letting
+    one failed check end it, or dropping the wait between checks, passed."""
+    class _Stop(Exception):
+        pass
+
+    runs, sleeps = [], []
+
+    async def run_check(n, state, *, trigger="scheduled"):
+        runs.append(trigger)
+        if len(runs) == 1:
+            raise RuntimeError("YouTube hiccup")
+
+    async def sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) == 4:
+            raise _Stop
+
+    monkeypatch.setattr(checker, "run_check", run_check)
+    monkeypatch.setattr(checker.asyncio, "sleep", sleep)
+    monkeypatch.setattr(config, "CHECK_INTERVAL_MINUTES", 30)
+    with pytest.raises(_Stop):
+        asyncio.run(checker.check_loop(notifier, {}))
+    assert runs == ["scheduled"] * 3  # the failed first check didn't end it
+    assert sleeps == [5, 1800, 1800, 1800]
 
 
 def test_overlapping_checks_work_in_more_than_one_event_loop(offline, monkeypatch, archive_path, notifier):
@@ -271,6 +535,54 @@ def test_setup_message_sent_even_if_start_came_after_first_check(offline, monkey
     assert notifier.sent == [("first_run", 2)]
 
 
+def test_failed_sends_are_retried_next_check(offline, monkeypatch, archive_path, notifier):
+    """Regression (F-077): no test ever made a send fail, so marking a video
+    seen before sending it, marking unsent videos seen while no chat is known,
+    or flagging the set-up message as sent before sending it all passed. Each
+    loses a notification for good; checker.py promises a retry."""
+    subs = _subs(1)
+    monkeypatch.setattr(youtube_playlist, "list_my_subscriptions", lambda: subs)
+
+    def fail_once(name):
+        real, calls = getattr(notifier, name), []
+
+        async def flaky(*args):
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("chat unreachable")
+            await real(*args)
+
+        monkeypatch.setattr(notifier, name, flaky)
+
+    fail_once("send_first_run")
+    asyncio.run(checker.run_check(notifier, {}))   # set-up message fails
+    asyncio.run(checker.run_check(notifier, {}))   # ...and goes out now
+    assert notifier.sent == [("first_run", 1)]
+
+    def feed_with_one_new(cid):
+        title, vids = _feed_stub()(cid)
+        vids.insert(0, {"video_id": "brand-new", "title": "n", "link": "l",
+                        "published": FRESH, "author": "a"})
+        return title, vids
+
+    monkeypatch.setattr(discovery, "fetch_channel_feed", feed_with_one_new)
+    asyncio.run(checker.run_check(_NoChat(), {}))  # found before /start: kept unseen
+    fail_once("send_video")
+    asyncio.run(checker.run_check(notifier, {}))   # the send fails
+    asyncio.run(checker.run_check(notifier, {}))   # ...and is retried
+    assert notifier.sent == [("first_run", 1), ("video", "brand-new")]
+
+    def not_authorized():
+        raise youtube_playlist.NotAuthorized("token dead")
+
+    monkeypatch.setattr(youtube_playlist, "list_my_subscriptions", not_authorized)
+    fail_once("send_auth_alert")
+    state = {}
+    asyncio.run(checker.run_check(notifier, state))  # the alert fails
+    asyncio.run(checker.run_check(notifier, state))  # ...and is not throttled away
+    assert notifier.sent[-1] == ("auth", "token dead")
+
+
 def test_start_during_a_check_survives_the_checks_save(offline, monkeypatch, archive_path):
     """Regression (F-001): /start persisting the chat while a check ran was
     overwritten by the check's save, so the pairing vanished on restart."""
@@ -353,6 +665,42 @@ def test_playlist_cache_ignored_after_rename(monkeypatch, tmp_path):
     assert youtube_playlist._read_playlist_id() is None
 
 
+def test_playlist_self_test_parses_its_arguments(monkeypatch, capsys):
+    """Regression (F-078): every argument was taken as a video id, so `--help`
+    (or a typo) ran the self-test and tried to insert "--help" twice."""
+    def no_youtube():
+        raise AssertionError("must not reach YouTube")
+
+    monkeypatch.setattr(youtube_playlist, "_load_credentials", no_youtube)
+    with pytest.raises(SystemExit) as exc:
+        youtube_playlist.main(["--help"])
+    assert exc.value.code == 0 and "video_id" in capsys.readouterr().out
+    # The last two are 11 characters, but not ASCII (regression, F-078 reopened).
+    for bad in (["--bogus"], ["not-an-id"], ["dQw4w9WgXcQ", "extra"],
+                ["α" * 11], ["٣" * 11]):
+        with pytest.raises(SystemExit) as exc:
+            youtube_playlist.main(bad)
+        assert exc.value.code == 2, bad
+    assert youtube_playlist.parse_args(["dQw4w9WgXcQ"]).video_id == "dQw4w9WgXcQ"
+    assert youtube_playlist.parse_args(["--", "-abcdefghij"]).video_id == "-abcdefghij"
+    assert youtube_playlist.parse_args([]).video_id is None
+
+
+def test_playlist_self_test_survives_a_console_without_emoji(monkeypatch, tmp_path):
+    """Regression (F-075): with its output piped or redirected on Windows (the
+    ANSI code page), the first "❌"/"🔗" line raised UnicodeEncodeError."""
+    import io
+    import sys
+
+    pytest.importorskip("google.oauth2.credentials")
+    out = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(config, "YOUTUBE_TOKEN_FILE", str(tmp_path / "none.json"))
+    assert youtube_playlist.main([]) == 1
+    out.flush()
+    assert "? YouTube isn't connected yet" in out.buffer.getvalue().decode("cp1252")
+
+
 def test_malformed_token_file_is_not_authorized(monkeypatch, tmp_path):
     """Regression (F-007): a token file missing fields raised ValueError, which
     the check swallowed as transient — no re-authorize alert ever went out."""
@@ -407,6 +755,36 @@ def test_muted_channel_is_not_fetched_and_type_rules_apply(offline, monkeypatch,
     assert fetched == [subs[1]["id"]]
     assert videos == [] and watched == 1  # all "video" type, channel is livestreams-only
     assert len(data["seen"]) == 15  # dropped items are recorded as seen
+
+
+def test_shorts_and_stale_videos_are_recorded_not_returned(offline, monkeypatch, archive_path):
+    """Regression (F-082): the fixture never produced a Short or an old
+    video, so either filter could be dropped with every test passing."""
+    subs = _subs(1)
+    cid = subs[0]["id"]
+    old = (datetime.now(timezone.utc) - timedelta(days=config.MAX_VIDEO_AGE_DAYS + 10)).isoformat()
+    monkeypatch.setattr(youtube_playlist, "list_my_subscriptions", lambda: subs)
+
+    def feed(channel_id):
+        title, vids = _feed_stub()(channel_id)
+        return title, vids + [
+            {"video_id": vid, "title": vid, "link": "l", "published": published, "author": "a"}
+            for vid, published in (("fresh", FRESH), ("short", FRESH), ("resurfaced", old))
+        ]
+
+    def classify(videos):
+        for v in videos:
+            v.update(type="video", is_short=v["video_id"] == "short")
+
+    monkeypatch.setattr(discovery, "fetch_channel_feed", feed)
+    monkeypatch.setattr(discovery, "classify_videos", classify)
+    data = archive.load(str(archive_path))
+    data["channels"] = [cid]  # already seeded; its 15 old uploads are new too
+    videos, _, _ = discovery.collect_new_videos(data)
+    returned = {v["video_id"] for v in videos}
+    assert "fresh" in returned
+    assert "short" not in returned and "resurfaced" not in returned
+    assert "short" in data["seen"] and "resurfaced" in data["seen"]
 
 
 def test_api_connection_error_does_not_log_the_key(monkeypatch, caplog):

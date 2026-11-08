@@ -30,6 +30,8 @@ def _load_dotenv(path=None):
             if not line or line.startswith("#") or "=" not in line:
                 continue
             key, _, val = line.partition("=")
+            if not key.strip():
+                continue  # "=value": no name to set (os.environ would raise)
             # A repeated key: the *last* line wins, as with systemd's
             # EnvironmentFile= (which the service uses) and setup_bot.py.
             values[key.strip()] = val.strip().strip('"').strip("'")

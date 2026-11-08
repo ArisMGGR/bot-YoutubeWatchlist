@@ -42,8 +42,8 @@ is reported with its recent logs). Preview without changing anything using
 Run the scripts with `bash` as shown: they work whether or not the files
 carry an executable bit (a checkout made from Windows may not).
 
-> It warns (but still installs) if `conf.env` is missing — the bot needs
-> `TELEGRAM_BOT_TOKEN` there or it will crash-loop.
+> It warns (but still installs) if it finds no bot token — no `conf.env`,
+> `token.txt` or `discord_token.txt` — since the bot would then crash-loop.
 
 ### Manual alternative
 

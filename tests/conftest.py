@@ -28,8 +28,9 @@ if os.path.exists(_CONF):
     with open(_CONF, encoding="utf-8-sig") as _f:
         for _line in _f:
             _line = _line.strip()
-            if _line and not _line.startswith("#") and "=" in _line:
-                os.environ.setdefault(_line.partition("=")[0].strip(), "")
+            _key = _line.partition("=")[0].strip()
+            if _key and not _line.startswith("#") and "=" in _line:
+                os.environ.setdefault(_key, "")
 
 import pytest  # noqa: E402
 

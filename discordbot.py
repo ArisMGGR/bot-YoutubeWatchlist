@@ -191,9 +191,11 @@ def describe_error(error: Exception) -> str:
     return ""
 
 
-# Discord error codes for an interaction we answered too late / twice.
+# Discord's error code for an interaction we answered too late. One answered
+# twice is our own bug, not the user's: discord.py raises InteractionResponded
+# for it, and Discord's 40060 arrives as a plain HTTPException, so both keep
+# their traceback (see log_handler_error).
 _UNKNOWN_INTERACTION = 10062
-_ALREADY_ACKNOWLEDGED = 40060
 
 
 def describe_expired_interaction(error: Exception) -> str:
@@ -211,11 +213,6 @@ def describe_expired_interaction(error: Exception) -> str:
             "Discord allows 3 seconds and my reply took longer (slow network, "
             "or the click arrived during a reconnect). Nothing was changed; "
             "just try again."
-        )
-    if isinstance(error, discord.HTTPException) and error.code == _ALREADY_ACKNOWLEDGED:
-        return (
-            "⌛ Discord says that click was already answered (probably a "
-            "double-click). Nothing to do."
         )
     return ""
 
@@ -270,7 +267,8 @@ def describe_connection_failure(error: Exception) -> str:
             f"Discord's servers answered with an error (HTTP {http.status}) — "
             "probably a Discord outage (see https://discordstatus.com)"
         )
-    if find(TimeoutError) or find(aiohttp.ServerTimeoutError):
+    # asyncio.TimeoutError is the builtin TimeoutError only from Python 3.11.
+    if find((TimeoutError, asyncio.TimeoutError)) or find(aiohttp.ServerTimeoutError):
         return (
             "Discord didn't answer within 60 seconds — the connection is very "
             "slow or dropping packets"
@@ -425,6 +423,22 @@ class DiscordNotifier:
 # --------------------------------------------------------------------------- #
 # The client
 # --------------------------------------------------------------------------- #
+class GuildSyncRefused(Exception):
+    """DISCORD_GUILD_ID names a server the commands can't be registered in.
+    It's numeric (main() checks that), so it's usually a channel's id pasted
+    instead of the server's, or a server the bot isn't in."""
+
+    def __init__(self, error):
+        super().__init__(
+            "❌ Discord refused to register the slash commands in server "
+            f"{config.DISCORD_GUILD_ID} (DISCORD_GUILD_ID): {error}. Check that "
+            "it's your server's id (right-click the server -> Copy Server ID, not "
+            "a channel), and that the bot is in that server, invited with the "
+            "applications.commands scope. Or remove DISCORD_GUILD_ID from "
+            "conf.env to register the commands globally."
+        )
+
+
 class WatchlistClient(discord.Client):
     def __init__(self):
         # Default (non-privileged) intents are plenty: slash commands and button
@@ -455,7 +469,10 @@ class WatchlistClient(discord.Client):
         if config.DISCORD_GUILD_ID:
             guild = discord.Object(id=int(config.DISCORD_GUILD_ID))
             self.tree.copy_global_to(guild=guild)
-            await self.tree.sync(guild=guild)
+            try:
+                await self.tree.sync(guild=guild)
+            except (discord.Forbidden, discord.NotFound) as exc:
+                raise GuildSyncRefused(exc) from exc
             # Also publish an empty global set: commands registered globally
             # by an earlier run without DISCORD_GUILD_ID would otherwise stay,
             # and every command would be listed twice in this server.
@@ -1063,6 +1080,8 @@ def main():
         client.run(config.DISCORD_BOT_TOKEN, log_handler=None)
     except discord.LoginFailure as exc:
         log.error(describe_error(exc))
+    except GuildSyncRefused as exc:
+        log.error(str(exc))
 
 
 if __name__ == "__main__":
